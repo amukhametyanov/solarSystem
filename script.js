@@ -21,6 +21,15 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
+// Raycaster for planet selection
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let selectedPlanet = null;
+let originalPosition = new THREE.Vector3();
+let dragging = false;
+let dragPlane = new THREE.Plane();
+let dragOffset = new THREE.Vector3();
+
 // Camera initial position
 camera.position.z = 50;
 camera.position.y = 20;
@@ -145,6 +154,15 @@ solarSystemData.planets.forEach(planetData => {
         planet.add(ring);
     }
     
+    // Store original orbit data for restore function
+    planet.userData = {
+        orbitObj: planetObj,
+        originalDistance: planetData.distance,
+        originalOrbitPosition: planetObj.rotation.y,
+        returningToOrbit: false,
+        returnSpeed: 0.05
+    };
+    
     // Store planet data for animation
     planets.push({
         mesh: planetObj,
@@ -163,6 +181,7 @@ const keys = {
 };
 
 let mouseDown = false;
+let rightMouseDown = false;
 let mouseX = 0;
 let mouseY = 0;
 
@@ -197,21 +216,131 @@ window.addEventListener('keyup', (e) => {
     }
 });
 
-// Event listeners for mouse
+// Planet selection and drag functions
+function findIntersectedPlanet(event) {
+    // Convert mouse position to normalized device coordinates
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    
+    // Update the raycaster
+    raycaster.setFromCamera(mouse, camera);
+    
+    // Find intersected objects
+    const intersects = raycaster.intersectObjects(scene.children, true);
+    
+    // Find the first intersected planet
+    for (let i = 0; i < intersects.length; i++) {
+        const object = intersects[i].object;
+        
+        // Check if this is a planet
+        const planetIndex = planets.findIndex(p => p.body === object);
+        if (planetIndex !== -1) {
+            return {
+                object: object,
+                point: intersects[i].point,
+                distance: intersects[i].distance
+            };
+        }
+    }
+    
+    return null;
+}
+
+// Animation parameters for returning planets
+const RETURN_DURATION = 1.5; // seconds for animation
+let returningPlanets = [];
+
+// Function to return a planet to its orbit
+function createReturnAnimation(planetBody, planetData) {
+    // Get current world position of the planet
+    const worldPosition = new THREE.Vector3();
+    planetBody.getWorldPosition(worldPosition);
+    
+    // Create animation data
+    return {
+        planet: planetBody,
+        planetData: planetData,
+        startPosition: worldPosition.clone(),
+        endPosition: new THREE.Vector3(planetData.data.distance, 0, 0), // Local position in orbit
+        startTime: Date.now() / 1000, // Current time in seconds
+        endTime: Date.now() / 1000 + RETURN_DURATION
+    };
+}
+
+// Mouse event listeners
 window.addEventListener('mousedown', (e) => {
-    if (e.button === 2) { // Right mouse button
-        mouseDown = true;
+    if (e.button === 0) { // Left mouse button
+        const intersection = findIntersectedPlanet(e);
+        if (intersection) {
+            selectedPlanet = intersection.object;
+            originalPosition.copy(selectedPlanet.position);
+            
+            // Remove planet from its orbit during drag
+            if (selectedPlanet.parent) {
+                const worldPosition = new THREE.Vector3();
+                selectedPlanet.getWorldPosition(worldPosition);
+                scene.attach(selectedPlanet);
+                selectedPlanet.position.copy(worldPosition);
+            }
+            
+            // Store initial interaction data
+            dragOffset = new THREE.Vector3();
+            dragOffset.copy(selectedPlanet.position);
+            dragOffset.project(camera);
+            
+            // Store the initial z-depth for depth movement
+            selectedPlanet.userData.initialZ = selectedPlanet.position.distanceTo(camera.position);
+            selectedPlanet.userData.initialMouseY = e.clientY;
+            
+            dragging = true;
+        }
+    } else if (e.button === 2) { // Right mouse button
+        rightMouseDown = true;
     }
 });
 
 window.addEventListener('mouseup', (e) => {
-    if (e.button === 2) { // Right mouse button
-        mouseDown = false;
+    if (e.button === 0) { // Left mouse button
+        if (dragging && selectedPlanet) {
+            // Find the planet data
+            const planetIndex = planets.findIndex(p => p.body === selectedPlanet);
+            if (planetIndex !== -1) {
+                const planetData = planets[planetIndex];
+                
+                // Create return animation
+                const returnAnimation = createReturnAnimation(selectedPlanet, planetData);
+                returningPlanets.push(returnAnimation);
+            }
+        }
+        dragging = false;
+        selectedPlanet = null;
+    } else if (e.button === 2) { // Right mouse button
+        rightMouseDown = false;
     }
 });
 
 window.addEventListener('mousemove', (e) => {
-    if (mouseDown) {
+    if (dragging && selectedPlanet) {
+        // Update mouse position
+        mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        
+        // Create vector for new position
+        const vector = new THREE.Vector3(mouse.x, mouse.y, dragOffset.z);
+        vector.unproject(camera);
+        
+        // Calculate direction from camera to this position
+        const dir = vector.sub(camera.position).normalize();
+        
+        // Calculate distance from camera based on mouse Y movement
+        const mouseYDelta = e.clientY - selectedPlanet.userData.initialMouseY;
+        const zoomFactor = mouseYDelta * 0.05; // Adjust this value to control zoom sensitivity
+        const newDistance = selectedPlanet.userData.initialZ - zoomFactor;
+        
+        // Set new position along the ray
+        const newPos = camera.position.clone().add(dir.multiplyScalar(newDistance));
+        selectedPlanet.position.copy(newPos);
+    } else if (rightMouseDown) {
         const movementX = e.movementX || 0;
         const movementY = e.movementY || 0;
         
@@ -245,11 +374,52 @@ function animate() {
     
     // Update planets
     planets.forEach(planet => {
-        // Rotate planet around its axis
-        planet.body.rotation.y += planet.data.rotationSpeed;
+        // Check if this planet is being dragged
+        const isBeingDragged = selectedPlanet === planet.body;
         
-        // Rotate planet around the sun
-        planet.mesh.rotation.y += planet.data.orbitSpeed;
+        // Only rotate planets that aren't being dragged
+        if (!isBeingDragged) {
+            // Rotate planet around its axis
+            planet.body.rotation.y += planet.data.rotationSpeed;
+            
+            // Rotate planet around the sun
+            planet.mesh.rotation.y += planet.data.orbitSpeed;
+            
+    // Handle returning planets
+    const currentTime = Date.now() / 1000;
+    for (let i = returningPlanets.length - 1; i >= 0; i--) {
+        const returnData = returningPlanets[i];
+        const { planet, planetData, startPosition, endPosition, startTime, endTime } = returnData;
+        
+        // Calculate progress (0 to 1)
+        const progress = Math.min(1, (currentTime - startTime) / (endTime - startTime));
+        
+        if (progress < 1) {
+            // Easing function for smoother animation (ease-out)
+            const easedProgress = 1 - Math.pow(1 - progress, 3);
+            
+            // Get current world position of orbit point
+            const orbitPoint = new THREE.Vector3(planetData.data.distance, 0, 0);
+            const worldOrbitPoint = new THREE.Vector3();
+            planetData.mesh.localToWorld(worldOrbitPoint.copy(orbitPoint));
+            
+            // Interpolate between start position and orbit point
+            const currentPosition = new THREE.Vector3();
+            currentPosition.lerpVectors(startPosition, worldOrbitPoint, easedProgress);
+            
+            // Update planet position in world space
+            planet.position.copy(currentPosition);
+        } else {
+            // Animation finished, attach planet back to its orbit
+            scene.remove(planet);
+            planetData.mesh.add(planet);
+            planet.position.copy(endPosition);
+            
+            // Remove from the animation list
+            returningPlanets.splice(i, 1);
+        }
+    }
+        }
     });
     
     // Rotate sun
